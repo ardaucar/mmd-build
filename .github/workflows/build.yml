@@ -1,0 +1,159 @@
+name: Build
+
+# Manual build runner. Details are documented in the private source repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing source tag to build, for example v0.3.0
+        required: true
+        type: string
+      platforms:
+        description: Platforms to build
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          TAG: ${{ inputs.tag }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "tag must look like v1.2.3" >&2
+            exit 1
+          fi
+          all='[{"name":"windows-x64","group":"windows","os":"windows-latest","target":"x86_64-pc-windows-msvc","args":""},{"name":"linux-x64","group":"linux","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","args":""},{"name":"macos-arm64","group":"macos","os":"macos-latest","target":"aarch64-apple-darwin","args":"--target aarch64-apple-darwin"},{"name":"macos-x64","group":"macos","os":"macos-latest","target":"x86_64-apple-darwin","args":"--target x86_64-apple-darwin"}]'
+          if [ "$PLATFORMS" = "all" ]; then
+            matrix="$all"
+          else
+            matrix=$(printf '%s' "$all" | node -e 'const g=process.argv[1];let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.stringify(JSON.parse(s).filter(e=>e.group===g))))' "$PLATFORMS")
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  prepare-release:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      # Only the helper scripts are needed; the rest of the source is not fetched.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SRC_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SRC_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Ensure the release exists
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_WRITE_TOKEN }}
+          RELEASES_REPO: ${{ vars.RELEASES_REPO }}
+          TAG: ${{ inputs.tag }}
+        run: node scripts/ensure-release.mjs
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: [plan, prepare-release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SRC_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SRC_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/fetch-sidecars.mjs --target ${{ matrix.target }}
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          # Token that can create releases in the private releases repo (not the source repo).
+          GITHUB_TOKEN: ${{ secrets.RELEASES_REPO_WRITE_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Compiled into the app (read-only token, releases repo only).
+          MMD_UPDATE_REPO: ${{ vars.RELEASES_REPO }}
+          MMD_UPDATE_TOKEN: ${{ secrets.RELEASES_REPO_READ_TOKEN }}
+          # Opt-in crash report server. Empty = reporting disabled in this build.
+          MMD_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        with:
+          owner: ${{ vars.RELEASES_REPO_OWNER }}
+          repo: ${{ vars.RELEASES_REPO_NAME }}
+          tagName: ${{ inputs.tag }}
+          releaseName: "${{ inputs.tag }}"
+          releaseBody: "See the assets below to install."
+          releaseDraft: false
+          prerelease: false
+          # The tag lives in the releases repo, so it is created from that repo's branch.
+          releaseCommitish: main
+          uploadUpdaterJson: true
+          args: ${{ matrix.args }}
+
+  # No artifacts are passed between jobs: the script reads the uploaded assets (including the
+  # .sig contents inside latest.json) from the private releases repo through the API.
+  publish-manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SRC_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SRC_READ_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: scripts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish the update manifest
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_WRITE_TOKEN }}
+          RELEASES_REPO: ${{ vars.RELEASES_REPO }}
+          TAG: ${{ inputs.tag }}
+        run: node scripts/publish-update-manifest.mjs
